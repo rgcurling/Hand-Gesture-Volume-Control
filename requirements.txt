@@ -1,0 +1,24 @@
+# Hand Gesture Volume Control — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Core computer-vision & hand-tracking
+mediapipe>=0.10.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# ── Windows only ──────────────────────────────────────────────────────────────
+# pycaw wraps the Windows Core Audio API for master volume control.
+# comtypes is a required dependency of pycaw.
+pycaw>=20230407; sys_platform == "win32"
+comtypes>=1.2.0; sys_platform == "win32"
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+# No extra packages needed — volume is controlled via the built-in
+# `osascript` command (AppleScript), which ships with every Mac.
+
+# ── Linux ─────────────────────────────────────────────────────────────────────
+# Requires `amixer` from the alsa-utils package (most distros include it).
+# For PulseAudio systems install pulseaudio-utils if `amixer -D pulse` fails.
+# Install via your package manager, NOT pip:
+#   sudo apt install alsa-utils          # Debian / Ubuntu
+#   sudo pacman -S alsa-utils            # Arch
