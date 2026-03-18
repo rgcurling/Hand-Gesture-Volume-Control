@@ -7,14 +7,14 @@ your thumb and index finger in front of a webcam.
 
 Gestures
 --------
-  Spread thumb & index apart  →  increase volume
+  Spread thumb & index apart   →  increase volume
   Pinch thumb & index together →  decrease volume
   Hold pinch for ~0.5 s        →  toggle mute / unmute
   Press Q                      →  quit cleanly
 
 Quick-start
 -----------
-  python -m venv .venv
+  python3.11 -m venv .venv
   source .venv/bin/activate          # macOS / Linux
   .venv\\Scripts\\activate             # Windows
   pip install -r requirements.txt
@@ -25,14 +25,21 @@ Platform support
   macOS   – osascript (built-in, no extra package needed)
   Windows – pycaw + comtypes  (install from requirements.txt)
   Linux   – amixer / PulseAudio  (install alsa-utils or pulseaudio-utils)
+
+Model
+-----
+  On first run, the MediaPipe hand-landmarker model (~29 MB) is downloaded
+  automatically to models/hand_landmarker.task and reused on future runs.
 """
 
 import collections
 import math
+import os
 import platform
 import subprocess
 import sys
 import time
+import urllib.request
 
 import cv2
 import mediapipe as mp
@@ -43,7 +50,7 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Camera
-CAMERA_INDEX  = 0
+CAMERA_INDEX  = 1       # 0 = first camera; change if wrong device is picked
 FRAME_WIDTH   = 1280
 FRAME_HEIGHT  = 720
 TARGET_FPS    = 30
@@ -59,34 +66,65 @@ MIN_DIST_PX = 30
 MAX_DIST_PX = 220
 
 # Smoothing: rolling-average window length (frames)
-# Larger = smoother but slightly more lag
 SMOOTH_WINDOW = 8
 
 # Mute gesture: distance below this threshold (px) triggers mute countdown
 MUTE_THRESHOLD_PX = 42
-# Number of consecutive frames the mute gesture must be held to toggle mute
-MUTE_HOLD_FRAMES  = 20      # ≈ 0.5 s at 30 fps
+# Frames the mute gesture must be held to toggle mute  (~0.5 s at 30 fps)
+MUTE_HOLD_FRAMES  = 20
 
 # Only call the OS volume API when volume changes by at least this amount
-# (avoids hammering the OS API every frame)
 VOL_UPDATE_EPSILON = 0.015  # 1.5 %
 
+# ─── MediaPipe model ──────────────────────────────────────────────────────────
+# The hand landmarker model is downloaded once and cached locally.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR   = os.path.join(_SCRIPT_DIR, "..", "models")
+MODEL_PATH  = os.path.join(MODEL_DIR, "hand_landmarker.task")
+MODEL_URL   = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+)
+
+# ─── Hand landmark indices (MediaPipe convention) ─────────────────────────────
+THUMB_TIP = 4
+INDEX_TIP = 8
+
+# ─── Hand skeleton connections (21 landmarks, 0-indexed) ──────────────────────
+# Used to draw the skeleton without the legacy mp.solutions drawing utilities.
+HAND_CONNECTIONS = [
+    # Thumb
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    # Index finger
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    # Middle finger
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    # Ring finger
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    # Pinky
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    # Palm
+    (0, 17),
+]
+
 # ─── UI geometry ─────────────────────────────────────────────────────────────
-BAR_X = 50      # left edge of volume bar
-BAR_Y = 150     # top edge of volume bar
-BAR_W = 32      # bar width
-BAR_H = 300     # bar height (full scale)
+BAR_X = 50
+BAR_Y = 150
+BAR_W = 32
+BAR_H = 300
 
 # ─── Colours (BGR) ───────────────────────────────────────────────────────────
 C_TEXT        = (255, 255, 255)
 C_DIM         = (160, 160, 160)
-C_LINE        = (0,   255, 255)   # cyan  – thumb-to-index connector
+C_LINE        = (0,   255, 255)   # cyan   – thumb-to-index connector
 C_TIP         = (255,   0, 255)   # magenta – fingertip circles
 C_MID         = (0,   255, 255)   # midpoint dot
+C_BONE        = (80,  180,  80)   # green  – skeleton bones
+C_JOINT       = (200, 200, 200)   # white  – skeleton joints
 C_BAR_BG      = (55,   55,  55)
 C_BAR_ACTIVE  = (0,   210,   0)   # green  – normal volume bar
 C_BAR_MUTED   = (200,  80,   0)   # blue   – muted volume bar
-C_MUTE_WARN   = (0,   130, 255)   # orange – mute-hold progress
+C_MUTE_WARN   = (0,   130, 255)   # orange – mute-hold progress arc
 C_MUTE_LABEL  = (200,  80,   0)   # blue   – "MUTED" text
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,18 +133,17 @@ C_MUTE_LABEL  = (200,  80,   0)   # blue   – "MUTED" text
 
 OS = platform.system()  # 'Darwin', 'Windows', 'Linux'
 
-# Windows: initialise pycaw once at module load so every frame doesn't re-open
 if OS == "Windows":
     try:
         from ctypes import POINTER, cast
         from comtypes import CLSCTX_ALL
         from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
-        _win_devices   = AudioUtilities.GetSpeakers()
-        _win_iface     = _win_devices.Activate(
+        _win_devices  = AudioUtilities.GetSpeakers()
+        _win_iface    = _win_devices.Activate(
             IAudioEndpointVolume._iid_, CLSCTX_ALL, None
         )
-        _win_vol_ctrl  = cast(_win_iface, POINTER(IAudioEndpointVolume))
+        _win_vol_ctrl = cast(_win_iface, POINTER(IAudioEndpointVolume))
     except ImportError:
         print("[ERROR] pycaw is not installed. Run: pip install pycaw comtypes")
         sys.exit(1)
@@ -116,7 +153,6 @@ def get_system_volume() -> float:
     """Return the current master volume as a float in [0.0, 1.0]."""
     if OS == "Windows":
         return float(_win_vol_ctrl.GetMasterVolumeLevelScalar())
-
     if OS == "Darwin":
         result = subprocess.run(
             ["osascript", "-e", "output volume of (get volume settings)"],
@@ -126,8 +162,7 @@ def get_system_volume() -> float:
             return float(result.stdout.strip()) / 100.0
         except ValueError:
             return 0.5
-
-    # Linux – amixer
+    # Linux
     result = subprocess.run(
         ["amixer", "get", "Master"], capture_output=True, text=True, timeout=1
     )
@@ -139,20 +174,15 @@ def get_system_volume() -> float:
 def set_system_volume(scalar: float) -> None:
     """Set master volume. scalar must be in [0.0, 1.0]."""
     scalar = max(0.0, min(1.0, scalar))
-
     if OS == "Windows":
         _win_vol_ctrl.SetMasterVolumeLevelScalar(scalar, None)
         return
-
     if OS == "Darwin":
-        # Popen (non-blocking) so the main loop is never stalled
         subprocess.Popen(
             ["osascript", "-e", f"set volume output volume {int(scalar * 100)}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         return
-
-    # Linux
     subprocess.Popen(
         ["amixer", "-D", "pulse", "sset", "Master", f"{int(scalar * 100)}%"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -164,7 +194,6 @@ def set_system_mute(muted: bool) -> None:
     if OS == "Windows":
         _win_vol_ctrl.SetMute(int(muted), None)
         return
-
     if OS == "Darwin":
         val = "true" if muted else "false"
         subprocess.Popen(
@@ -172,8 +201,6 @@ def set_system_mute(muted: bool) -> None:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         return
-
-    # Linux
     toggle = "mute" if muted else "unmute"
     subprocess.Popen(
         ["amixer", "-D", "pulse", "sset", "Master", toggle],
@@ -196,47 +223,61 @@ def init_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
-    # Keep the internal buffer small so we always process the latest frame
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)  # minimal buffer → lowest latency
     return cap
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hand detection
+# Hand detection  (MediaPipe Tasks API — works with mediapipe >= 0.10)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def ensure_model() -> None:
+    """Download the hand landmarker model on first run."""
+    if os.path.exists(MODEL_PATH):
+        return
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    print("[INFO] Downloading hand landmarker model (~29 MB) — one-time setup…")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print(f"[INFO] Model saved to {MODEL_PATH}")
+
+
 def init_hand_detector():
-    """Return a configured MediaPipe Hands detector."""
-    mp_hands = mp.solutions.hands
-    detector = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=MIN_DETECTION_CONF,
+    """Return a configured MediaPipe HandLandmarker (Tasks API)."""
+    ensure_model()
+    base_options = mp.tasks.BaseOptions(model_asset_path=MODEL_PATH)
+    options = mp.tasks.vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=MIN_DETECTION_CONF,
+        min_hand_presence_confidence=MIN_TRACKING_CONF,
         min_tracking_confidence=MIN_TRACKING_CONF,
     )
-    return detector, mp_hands
+    return mp.tasks.vision.HandLandmarker.create_from_options(options)
 
 
-def process_frame(frame_rgb: np.ndarray, detector) -> tuple:
+def process_frame(
+    frame_rgb: np.ndarray,
+    detector,
+    timestamp_ms: int,
+) -> list | None:
     """
-    Run hand detection on an RGB frame.
+    Run hand detection on one RGB frame.
 
-    Returns
-    -------
-    results   : raw MediaPipe result object (needed for skeleton drawing)
-    landmarks : list of (x_px, y_px) for all 21 hand landmarks, or None
+    Returns a list of 21 (x_px, y_px) tuples for the detected hand,
+    or None if no hand is found.
     """
-    results = detector.process(frame_rgb)
-    if not results.multi_hand_landmarks:
-        return results, None
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+    result   = detector.detect_for_video(mp_image, timestamp_ms)
+
+    if not result.hand_landmarks:
+        return None
 
     h, w = frame_rgb.shape[:2]
-    hand = results.multi_hand_landmarks[0]
-    landmarks = [
+    return [
         (int(lm.x * w), int(lm.y * h))
-        for lm in hand.landmark
+        for lm in result.hand_landmarks[0]
     ]
-    return results, landmarks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +285,7 @@ def process_frame(frame_rgb: np.ndarray, detector) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def euclidean(p1: tuple, p2: tuple) -> float:
-    """Euclidean distance between two (x, y) points in pixels."""
+    """Euclidean distance between two (x, y) pixel points."""
     return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
 
@@ -254,44 +295,33 @@ def dist_to_volume(
     max_dist: float = MAX_DIST_PX,
 ) -> float:
     """
-    Map pixel distance between thumb tip and index tip to a [0.0, 1.0] scalar.
+    Map finger-gap (pixels) to a volume scalar in [0.0, 1.0].
 
-    Mapping
-    -------
-      dist ≤ min_dist  →  0.0  (fingers touching / pinched → silent)
-      dist ≥ max_dist  →  1.0  (fingers wide open → full volume)
+      dist ≤ min_dist  →  0.0   (pinched  → silent)
+      dist ≥ max_dist  →  1.0   (spread   → full volume)
       in-between       →  linear interpolation, clamped
-
-    The caller applies smoothing before this value reaches the OS API.
     """
     if max_dist <= min_dist:
         return 0.0
-    raw = (dist_px - min_dist) / (max_dist - min_dist)
-    return max(0.0, min(1.0, raw))
+    return max(0.0, min(1.0, (dist_px - min_dist) / (max_dist - min_dist)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI drawing helpers
+# UI drawing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def draw_hand_skeleton(
-    frame: np.ndarray,
-    mp_results,
-    mp_hands_module,
-    draw_utils,
-    draw_styles,
-) -> None:
-    """Draw the full 21-point hand skeleton using MediaPipe's built-in styles."""
-    if not mp_results.multi_hand_landmarks:
-        return
-    for hand_lm in mp_results.multi_hand_landmarks:
-        draw_utils.draw_landmarks(
-            frame,
-            hand_lm,
-            mp_hands_module.HAND_CONNECTIONS,
-            draw_styles.get_default_hand_landmarks_style(),
-            draw_styles.get_default_hand_connections_style(),
+def draw_hand_skeleton(frame: np.ndarray, landmarks_px: list) -> None:
+    """Draw the full 21-point hand skeleton from pixel-coordinate landmarks."""
+    # Connections
+    for start, end in HAND_CONNECTIONS:
+        cv2.line(
+            frame, landmarks_px[start], landmarks_px[end],
+            C_BONE, 2, cv2.LINE_AA,
         )
+    # Joint dots
+    for pt in landmarks_px:
+        cv2.circle(frame, pt, 5, C_JOINT, cv2.FILLED)
+        cv2.circle(frame, pt, 5, C_BONE,  1, cv2.LINE_AA)
 
 
 def draw_fingertip_overlay(
@@ -299,10 +329,7 @@ def draw_fingertip_overlay(
     thumb_pt: tuple,
     index_pt: tuple,
 ) -> None:
-    """
-    Highlight the thumb tip, index tip, and the line between them.
-    Drawn on top of the skeleton so it is clearly visible.
-    """
+    """Cyan line + magenta circles on the two tracked fingertips."""
     mid_pt = (
         (thumb_pt[0] + index_pt[0]) // 2,
         (thumb_pt[1] + index_pt[1]) // 2,
@@ -312,7 +339,7 @@ def draw_fingertip_overlay(
     cv2.circle(frame, index_pt, 14, C_TIP,  cv2.FILLED)
     cv2.circle(frame, thumb_pt, 14, C_TEXT,  1, cv2.LINE_AA)
     cv2.circle(frame, index_pt, 14, C_TEXT,  1, cv2.LINE_AA)
-    cv2.circle(frame, mid_pt,   8,  C_MID,  cv2.FILLED)
+    cv2.circle(frame, mid_pt,    8, C_MID,  cv2.FILLED)
 
 
 def draw_volume_bar(
@@ -320,19 +347,12 @@ def draw_volume_bar(
     volume_scalar: float,
     is_muted: bool,
 ) -> None:
-    """
-    Vertical bar on the left side of the frame.
-      Green fill   = active volume level
-      Blue fill    = muted
-    The bar fills from the bottom upwards, matching natural intuition.
-    """
+    """Vertical volume bar — green (active) or blue (muted), fills from bottom."""
     x, y, w, h = BAR_X, BAR_Y, BAR_W, BAR_H
 
-    # Background track
     cv2.rectangle(frame, (x, y), (x + w, y + h), C_BAR_BG, cv2.FILLED)
 
-    # Filled portion proportional to current volume
-    fill_h = int(h * volume_scalar)
+    fill_h    = int(h * volume_scalar)
     bar_color = C_BAR_MUTED if is_muted else C_BAR_ACTIVE
     if fill_h > 0:
         cv2.rectangle(
@@ -342,17 +362,13 @@ def draw_volume_bar(
             bar_color, cv2.FILLED,
         )
 
-    # Border
     cv2.rectangle(frame, (x, y), (x + w, y + h), C_DIM, 1)
 
-    # Percentage label below the bar
-    label = f"{int(volume_scalar * 100)}%"
     cv2.putText(
-        frame, label, (x - 2, y + h + 26),
+        frame, f"{int(volume_scalar * 100)}%",
+        (x - 2, y + h + 26),
         cv2.FONT_HERSHEY_SIMPLEX, 0.85, C_TEXT, 2, cv2.LINE_AA,
     )
-
-    # Scale markers
     cv2.putText(
         frame, "MAX", (x + w + 8, y + 14),
         cv2.FONT_HERSHEY_SIMPLEX, 0.44, C_DIM, 1, cv2.LINE_AA,
@@ -362,51 +378,38 @@ def draw_volume_bar(
         cv2.FONT_HERSHEY_SIMPLEX, 0.44, C_DIM, 1, cv2.LINE_AA,
     )
 
-    # Gesture range markers (visual guide)
-    min_y = y + h - int(h * 0.0)   # MIN_DIST → bottom
-    max_y = y + h - int(h * 1.0)   # MAX_DIST → top
-    cv2.line(frame, (x - 6, min_y), (x, min_y), C_DIM, 1)
-    cv2.line(frame, (x - 6, max_y), (x, max_y), C_DIM, 1)
-
 
 def draw_mute_ui(
     frame: np.ndarray,
     is_muted: bool,
     mute_progress: float,
 ) -> None:
-    """
-    Show a centred 'MUTED' banner when audio is muted, or an arc progress
-    indicator while the mute-hold gesture is being held.
-    """
-    h, w = frame.shape[:2]
-    cx, cy = w // 2, 65
+    """'MUTED' banner when muted; sweep arc while holding the pinch gesture."""
+    fh, fw = frame.shape[:2]
+    cx, cy = fw // 2, 65
 
     if is_muted:
         text = "MUTED"
         (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
-        # Faint background pill
         cv2.rectangle(
             frame,
-            ((w - tw) // 2 - 16, 30),
-            ((w + tw) // 2 + 16, 90),
+            ((fw - tw) // 2 - 16, 30),
+            ((fw + tw) // 2 + 16, 90),
             (20, 20, 20), cv2.FILLED,
         )
         cv2.putText(
-            frame, text, ((w - tw) // 2, 82),
+            frame, text, ((fw - tw) // 2, 82),
             cv2.FONT_HERSHEY_SIMPLEX, 1.5, C_MUTE_LABEL, 3, cv2.LINE_AA,
         )
     elif mute_progress > 0.0:
-        # Arc sweeps clockwise as the user holds the pinch gesture
-        angle = int(360 * mute_progress)
-        radius = 28
         cv2.ellipse(
-            frame, (cx, cy), (radius, radius),
-            -90, 0, angle,
+            frame, (cx, cy), (28, 28),
+            -90, 0, int(360 * mute_progress),
             C_MUTE_WARN, 4, cv2.LINE_AA,
         )
         cv2.putText(
             frame, "Hold to mute",
-            (cx - 58, cy + radius + 22),
+            (cx - 58, cy + 50),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, C_MUTE_WARN, 1, cv2.LINE_AA,
         )
 
@@ -417,7 +420,7 @@ def draw_hud(
     dist_px: float,
     hand_detected: bool,
 ) -> None:
-    """Top-right HUD showing FPS, detection status, and raw finger distance."""
+    """Top-right HUD: FPS, detection status, finger gap."""
     fw = frame.shape[1]
     cv2.putText(
         frame, f"FPS: {fps:.0f}",
@@ -440,15 +443,14 @@ def draw_hud(
 
 
 def draw_instructions(frame: np.ndarray) -> None:
-    """Small legend at the bottom-left corner."""
+    """Small help legend at the bottom-left corner."""
     fh = frame.shape[0]
-    lines = [
+    for i, line in enumerate([
         "Q  – quit",
         "Hold pinch  – mute toggle",
         "Pinch closer  – quieter",
         "Spread apart  – louder",
-    ]
-    for i, line in enumerate(lines):
+    ]):
         cv2.putText(
             frame, line,
             (12, fh - 14 - i * 22),
@@ -466,33 +468,25 @@ def main() -> None:
     cap = init_camera()
 
     print("[INFO] Initialising MediaPipe hand detector…")
-    detector, mp_hands = init_hand_detector()
-    mp_draw        = mp.solutions.drawing_utils
-    mp_draw_styles = mp.solutions.drawing_styles
+    detector = init_hand_detector()
 
     # ── State ────────────────────────────────────────────────────────────────
-    # Rolling-average buffer for volume smoothing
-    smooth_buf = collections.deque(maxlen=SMOOTH_WINDOW)
-
-    # Mute-gesture state
-    mute_hold_count  = 0    # consecutive frames the pinch has been held
-    mute_released    = True  # True when fingers are outside the mute zone
+    smooth_buf       = collections.deque(maxlen=SMOOTH_WINDOW)
+    mute_hold_count  = 0
+    mute_released    = True
     is_muted         = False
+    last_sent_vol    = -1.0
+    dist_px          = 0.0
 
-    # Volume tracking (avoid redundant OS calls)
-    last_sent_vol = -1.0
-    dist_px       = 0.0     # last measured finger gap (displayed in HUD)
-
-    # Seed the smooth buffer from the actual current volume
     try:
         current_vol = get_system_volume()
     except Exception:
         current_vol = 0.5
     smooth_buf.extend([current_vol] * SMOOTH_WINDOW)
 
-    # FPS measurement
-    fps_buf   = collections.deque(maxlen=30)
-    prev_time = time.perf_counter()
+    fps_buf      = collections.deque(maxlen=30)
+    prev_time    = time.perf_counter()
+    start_time   = time.perf_counter()  # reference for monotonic timestamps
 
     print("[INFO] Running — press Q in the video window to quit.\n")
 
@@ -502,42 +496,33 @@ def main() -> None:
             print("[ERROR] Failed to read camera frame — exiting.")
             break
 
-        # Flip horizontally so the feed acts like a mirror (more intuitive)
-        frame = cv2.flip(frame, 1)
+        frame = cv2.flip(frame, 1)  # mirror so it feels natural
 
-        # ── FPS counter ──────────────────────────────────────────────────────
+        # ── FPS ──────────────────────────────────────────────────────────────
         now = time.perf_counter()
         fps_buf.append(1.0 / max(now - prev_time, 1e-9))
         prev_time = now
         fps = sum(fps_buf) / len(fps_buf)
 
         # ── Hand detection ───────────────────────────────────────────────────
-        # MediaPipe requires an RGB image; frame is BGR from OpenCV
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_results, landmarks = process_frame(frame_rgb, detector)
+        frame_rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        timestamp_ms = int((now - start_time) * 1000)
+        landmarks    = process_frame(frame_rgb, detector, timestamp_ms)
         hand_detected = landmarks is not None
 
-        # ── Gesture processing ───────────────────────────────────────────────
         mute_progress = 0.0
 
         if hand_detected:
-            # Landmark indices defined by MediaPipe:
-            #   4  = THUMB_TIP
-            #   8  = INDEX_FINGER_TIP
-            thumb_pt = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-            index_pt = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-
+            thumb_pt = landmarks[THUMB_TIP]
+            index_pt = landmarks[INDEX_TIP]
             dist_px  = euclidean(thumb_pt, index_pt)
             raw_vol  = dist_to_volume(dist_px)
 
-            # ── Smoothing: rolling average ────────────────────────────────
+            # ── Smoothing ────────────────────────────────────────────────────
             smooth_buf.append(raw_vol)
             smoothed_vol = sum(smooth_buf) / len(smooth_buf)
 
-            # ── Mute gesture ──────────────────────────────────────────────
-            # The user must bring fingers within MUTE_THRESHOLD_PX AND hold
-            # them there for MUTE_HOLD_FRAMES before the mute toggles.
-            # 'mute_released' prevents continuous toggling while held.
+            # ── Mute gesture ─────────────────────────────────────────────────
             if dist_px < MUTE_THRESHOLD_PX:
                 if mute_released:
                     mute_hold_count += 1
@@ -545,16 +530,14 @@ def main() -> None:
                         is_muted = not is_muted
                         set_system_mute(is_muted)
                         mute_hold_count = 0
-                        mute_released   = False  # require a release first
+                        mute_released   = False
             else:
                 mute_hold_count = 0
                 mute_released   = True
 
             mute_progress = min(mute_hold_count / MUTE_HOLD_FRAMES, 1.0)
 
-            # ── Volume update ─────────────────────────────────────────────
-            # Skip OS call when muted (let the mute flag do the work) and
-            # when the change is below the update epsilon (debounce).
+            # ── Volume update ────────────────────────────────────────────────
             if not is_muted:
                 if abs(smoothed_vol - last_sent_vol) >= VOL_UPDATE_EPSILON:
                     set_system_volume(smoothed_vol)
@@ -562,8 +545,8 @@ def main() -> None:
 
             current_vol = smoothed_vol
 
-            # ── Draw overlays ─────────────────────────────────────────────
-            draw_hand_skeleton(frame, mp_results, mp_hands, mp_draw, mp_draw_styles)
+            # ── Draw hand ────────────────────────────────────────────────────
+            draw_hand_skeleton(frame, landmarks)
             draw_fingertip_overlay(frame, thumb_pt, index_pt)
 
         # ── Always-on UI ─────────────────────────────────────────────────────
@@ -574,7 +557,6 @@ def main() -> None:
 
         cv2.imshow("Hand Volume Control  |  press Q to quit", frame)
 
-        # Exit on Q or on window close
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q") or cv2.getWindowProperty(
             "Hand Volume Control  |  press Q to quit",
@@ -582,7 +564,6 @@ def main() -> None:
         ) < 1:
             break
 
-    # ── Cleanup ──────────────────────────────────────────────────────────────
     cap.release()
     detector.close()
     cv2.destroyAllWindows()
