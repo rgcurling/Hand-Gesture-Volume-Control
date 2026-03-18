@@ -1,32 +1,64 @@
 # Hand Gesture Volume Control
 
-Control your computer's master volume in real-time by moving your hand in
-front of a webcam — no keyboard, no mouse. Pinch your thumb and index finger
-together to lower the volume; spread them apart to raise it.
+> Control your Mac, Windows, or Linux system volume in real-time using just
+> your hand in front of a webcam — no keyboard, no mouse required.
+
+Pinch your **thumb and index finger** together to lower the volume. Spread
+them apart to raise it. Hold the pinch for half a second to toggle mute.
+
+---
+
+## Demo
+
+| Gesture | Result |
+|---|---|
+| Fingers spread wide | 100 % volume |
+| Fingers halfway apart | ~50 % volume |
+| Fingers almost touching | 0 % volume |
+| Hold pinch ~0.5 s | Mute / unmute toggle |
+| Press `Q` | Quit |
+
+---
 
 ## Features
 
-- Real-time hand tracking via MediaPipe (runs at ~30 fps on a modern laptop)
-- Euclidean distance between **thumb tip** and **index finger tip** maps to
-  0–100 % system volume
-- Rolling-average smoothing prevents erratic jumps
-- Hold the pinch for ~0.5 s to **toggle mute / unmute**
-- Live OpenCV window with:
+- Real-time hand tracking via **MediaPipe** — detects and tracks a hand at ~30 fps
+- **Euclidean distance** between thumb tip and index fingertip drives volume (0–100 %)
+- **Rolling-average smoothing** (8-frame window) eliminates jitter
+- **Mute-hold gesture** — sustained pinch toggles mute without extra hardware
+- Live **OpenCV** window showing:
   - Full 21-point hand skeleton overlay
-  - Cyan line + magenta circles on the tracked fingertips
+  - Cyan connector line + magenta circles on tracked fingertips
   - Vertical volume bar (green = active, blue = muted)
-  - Mute-hold progress arc
+  - Mute-hold countdown arc
   - FPS counter and hand-detection status
 - Cross-platform: **macOS**, **Windows**, **Linux**
-- Press `Q` to quit cleanly
+- Single-file implementation — easy to read, extend, and embed
+
+---
+
+## Requirements
+
+- Python **3.8 – 3.11** (MediaPipe does not yet support 3.12+)
+- A working webcam
+- macOS, Windows 10/11, or a Linux desktop with ALSA/PulseAudio
+
+---
 
 ## Setup
 
-### 1 — Create a virtual environment
+### 1 — Clone the repo
+
+```bash
+git clone https://github.com/rgcurling/Hand-Gesture-Volume-Control.git
+cd Hand-Gesture-Volume-Control
+```
+
+### 2 — Create a virtual environment
 
 ```bash
 # macOS / Linux
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 
 # Windows
@@ -34,93 +66,91 @@ python -m venv .venv
 .venv\Scripts\activate
 ```
 
-### 2 — Install dependencies
+### 3 — Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> **Linux only** — `amixer` must also be available:
-> ```bash
-> sudo apt install alsa-utils      # Debian / Ubuntu
-> sudo pacman -S alsa-utils        # Arch
-> ```
->
-> **macOS** — no extra packages; the script uses the built-in `osascript`.
->
-> **Windows** — `pycaw` and `comtypes` are installed automatically by pip.
+**Platform notes**
 
-### 3 — Run
+| Platform | Volume backend | Extra steps |
+|---|---|---|
+| macOS | `osascript` (built-in) | None |
+| Windows | `pycaw` + `comtypes` | Installed automatically by pip |
+| Linux | `amixer` (ALSA) | `sudo apt install alsa-utils` |
+
+### 4 — Run
 
 ```bash
 python src/hand_volume_control.py
 ```
 
-A window titled **"Hand Volume Control"** will open. Hold your hand up so the
-webcam can see it clearly.
+A window titled **"Hand Volume Control"** opens. Hold your hand up in front of
+the webcam with the palm facing the camera, and move your thumb and index
+finger to control the volume.
 
-## Gestures
+---
 
-| Gesture | Action |
-|---|---|
-| Spread thumb & index apart | Increase volume |
-| Pinch thumb & index together | Decrease volume |
-| Hold pinch for ~0.5 s | Toggle mute / unmute |
-| Press `Q` | Quit |
-
-## How the gesture-to-volume mapping works
+## How the mapping works
 
 ```
-Pixel distance between fingertips
-                │
-    ≤ 30 px ────┼──── 0 % volume   (fingers almost touching)
-                │
-   30 – 220 px  ┼──── linear interpolation
-                │
-   ≥ 220 px ────┼──── 100 % volume  (fingers wide open)
+Finger gap (pixels)
+        │
+  ≤ 30 ─┼─ 0 %   (pinched / almost touching)
+        │
+ 30–220 ─┼─ linear interpolation
+        │
+ ≥ 220 ─┼─ 100 % (fully spread)
 ```
 
-1. **Measure** — MediaPipe provides normalised (x, y, z) coordinates for 21
-   hand landmarks. Landmark 4 is the thumb tip; landmark 8 is the index
-   fingertip. Both are converted to pixel coordinates for the current frame
-   resolution.
-
-2. **Distance** — The Euclidean distance `√((x₂−x₁)² + (y₂−y₁)²)` gives a
-   pixel gap that grows as the fingers spread and shrinks as they pinch.
-
-3. **Map** — The raw distance is linearly interpolated between `MIN_DIST_PX`
-   (= 0 %) and `MAX_DIST_PX` (= 100 %) and clamped to [0, 1].
-
-4. **Smooth** — The last 8 mapped values are averaged (rolling window) to
-   absorb frame-to-frame jitter before the value is sent to the OS.
-
+1. **Detect** — MediaPipe returns normalised (x, y) for 21 hand landmarks.
+   Landmark 4 = thumb tip, landmark 8 = index fingertip.
+2. **Measure** — Euclidean distance `√((x₂−x₁)² + (y₂−y₁)²)` is computed in
+   pixels for the current frame resolution.
+3. **Map** — Distance is linearly interpolated between `MIN_DIST_PX` and
+   `MAX_DIST_PX` and clamped to [0, 1].
+4. **Smooth** — The last 8 mapped values are rolling-averaged to absorb
+   frame-to-frame noise before reaching the OS.
 5. **Debounce** — The OS volume API is only called when the smoothed value
-   changes by more than 1.5 percentage points, preventing unnecessary system
-   calls every frame.
+   changes by more than 1.5 %, avoiding redundant system calls every frame.
+
+---
+
+## Configuration
+
+All tunable constants are at the top of [src/hand_volume_control.py](src/hand_volume_control.py):
+
+| Constant | Default | Description |
+|---|---|---|
+| `CAMERA_INDEX` | `0` | Webcam index (try `1` if `0` doesn't work) |
+| `FRAME_WIDTH / HEIGHT` | `1280 × 720` | Capture resolution |
+| `MIN_DIST_PX` | `30` | Finger gap → 0 % volume |
+| `MAX_DIST_PX` | `220` | Finger gap → 100 % volume |
+| `SMOOTH_WINDOW` | `8` | Rolling-average window (frames) |
+| `MUTE_THRESHOLD_PX` | `42` | Gap below which mute countdown starts |
+| `MUTE_HOLD_FRAMES` | `20` | Frames to hold pinch to toggle mute (~0.5 s) |
+| `VOL_UPDATE_EPSILON` | `0.015` | Minimum delta before calling OS API |
+| `MIN_DETECTION_CONF` | `0.75` | MediaPipe detection confidence threshold |
+
+---
 
 ## Project structure
 
 ```
 src/
-  hand_volume_control.py   # complete implementation
-requirements.txt
+  hand_volume_control.py   # complete single-file implementation
+requirements.txt           # pip dependencies
 README.md
+LICENSE
 ```
 
-## Configuration
+---
 
-All tunable parameters live at the top of `src/hand_volume_control.py`:
+## Contributing
 
-| Constant | Default | Effect |
-|---|---|---|
-| `MIN_DIST_PX` | 30 | Finger gap (px) mapped to 0 % volume |
-| `MAX_DIST_PX` | 220 | Finger gap (px) mapped to 100 % volume |
-| `SMOOTH_WINDOW` | 8 | Rolling-average window size (frames) |
-| `MUTE_THRESHOLD_PX` | 42 | Gap below which mute countdown starts |
-| `MUTE_HOLD_FRAMES` | 20 | Frames to hold pinch to toggle mute (~0.5 s) |
-| `VOL_UPDATE_EPSILON` | 0.015 | Minimum change before calling OS API |
-| `CAMERA_INDEX` | 0 | Webcam index (try 1 if 0 doesn't work) |
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.
