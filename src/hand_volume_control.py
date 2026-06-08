@@ -50,7 +50,7 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Camera
-CAMERA_INDEX  = 1       # 0 = first camera; change if wrong device is picked
+CAMERA_INDEX  = 0       # 0 = first camera; change to 1 if additional camera is available
 FRAME_WIDTH   = 1280
 FRAME_HEIGHT  = 720
 TARGET_FPS    = 30
@@ -140,7 +140,7 @@ if OS == "Windows":
         from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
         _win_devices  = AudioUtilities.GetSpeakers()
-        _win_iface    = _win_devices.Activate(
+        _win_iface    = _win_devices._dev.Activate(
             IAudioEndpointVolume._iid_, CLSCTX_ALL, None
         )
         _win_vol_ctrl = cast(_win_iface, POINTER(IAudioEndpointVolume))
